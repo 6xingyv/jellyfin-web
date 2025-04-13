@@ -1,280 +1,193 @@
-import escapeHtml from 'escape-html';
-
-import autoFocuser from 'components/autoFocuser';
+import { LyricPlayer, EplorRenderer } from '@applemusic-like-lyrics/core';
 import { appRouter } from '../components/router/appRouter';
-import layoutManager from 'components/layoutManager';
 import { playbackManager } from '../components/playback/playbackmanager';
 import ServerConnections from '../components/ServerConnections';
-import scrollManager from 'components/scrollManager';
-import focusManager from 'components/focusManager';
-
-import keyboardNavigation from 'scripts/keyboardNavigation';
 import globalize from 'lib/globalize';
 import LibraryMenu from 'scripts/libraryMenu';
 import Events from 'utils/events';
 
 import '../styles/lyrics.scss';
-import { AutoScroll } from './lyrics.types';
 
 let currentPlayer;
 let currentItem;
+let lyricsPlayer;
+let lastUpdateTime;
+let animationFrameId;
+let bgRenderer:EplorRenderer;
 
-let savedLyrics;
-let isDynamicLyric = false;
-let autoScroll = AutoScroll.Instant;
+function getCurrentTime() {
+    return (playbackManager.currentTime() || 0) * 1000; // 转换为毫秒
+}
 
-function dynamicLyricHtmlReducer(htmlAccumulator, lyric, index) {
-    if (layoutManager.tv) {
-        htmlAccumulator += `<button class="lyricsLine dynamicLyric listItem show-focus" id="lyricPosition${index}" data-lyrictime="${lyric.Start}">${escapeHtml(lyric.Text)}</button>`;
-    } else {
-        htmlAccumulator += `<div class="lyricsLine dynamicLyric" id="lyricPosition${index}" data-lyrictime="${lyric.Start}">${escapeHtml(lyric.Text)}</div>`;
+function toLyricLines(lyrics) {
+    // 按时间分组整理歌词
+    const groupedLyrics = new Map();
+    for (const lyric of lyrics) {
+        if (lyric.Start && lyric.Text) {
+            const time = lyric.Start;
+            if (!groupedLyrics.has(time)) {
+                groupedLyrics.set(time, { main: '', translation: '' });
+            }
+            if (/[\u4e00-\u9fa5]/.test(lyric.Text)) {
+                groupedLyrics.get(time).translation = lyric.Text;
+            } else {
+                groupedLyrics.get(time).main = lyric.Text;
+            }
+        }
     }
-    return htmlAccumulator;
+
+    // 转换为 LyricLine 数组
+    return Array.from(groupedLyrics.entries())
+        .sort(([a], [b]) => a - b)
+        .map(([startTick, content], index, array) => {
+            const startTime = (startTick / 10000) * 1000;
+            const endTime = index < array.length - 1 ?
+                (array[index + 1][0] / 10000) * 1000 :
+                startTime + 5000;
+
+            return {
+                words: [{
+                    startTime,
+                    endTime,
+                    word: content.main
+                }],
+                translatedLyric: content.translation,
+                romanLyric: '',
+                startTime,
+                endTime,
+                isBG: false,
+                isDuet: false
+            };
+        });
 }
 
-function staticLyricHtmlReducer(htmlAccumulator, lyric, index) {
-    if (layoutManager.tv) {
-        htmlAccumulator += `<button class="lyricsLine listItem show-focus" id="lyricPosition${index}">${escapeHtml(lyric.Text)}</button>`;
-    } else {
-        htmlAccumulator += `<div class="lyricsLine" id="lyricPosition${index}">${escapeHtml(lyric.Text)}</div>`;
-    }
-    return htmlAccumulator;
-}
+function updateLyrics(currentTime) {
+    if (!lyricsPlayer) return;
 
-function getLyricIndex(time, lyrics) {
-    return lyrics.findLastIndex(lyric => lyric.Start <= time);
-}
+    const now = performance.now();
+    const delta = lastUpdateTime ? now - lastUpdateTime : 0;
+    lastUpdateTime = now;
 
-function getCurrentPlayTime() {
-    let currentTime = playbackManager.currentTime();
-    if (currentTime === undefined) currentTime = 0;
-    //convert to ticks
-    return currentTime * 10000;
+    lyricsPlayer.setCurrentTime(currentTime);
+    lyricsPlayer.update(delta);
+
+    animationFrameId = requestAnimationFrame(() => {
+        updateLyrics(getCurrentTime());
+    });
 }
 
 export default function (view) {
-    function setPastLyricClassOnLine(line) {
-        const lyric = view.querySelector(`#lyricPosition${line}`);
-        if (lyric) {
-            lyric.classList.remove('futureLyric');
-            lyric.classList.add('pastLyric');
-        }
-    }
-
-    function setFutureLyricClassOnLine(line) {
-        const lyric = view.querySelector(`#lyricPosition${line}`);
-        if (lyric) {
-            lyric.classList.remove('pastLyric');
-            lyric.classList.add('futureLyric');
-        }
-    }
-
-    function setCurrentLyricClassOnLine(line) {
-        const lyric = view.querySelector(`#lyricPosition${line}`);
-        if (lyric) {
-            lyric.classList.remove('pastLyric');
-            lyric.classList.remove('futureLyric');
-            if (autoScroll !== AutoScroll.NoScroll) {
-                // instant scroll is used when the view is first loaded
-                scrollManager.scrollToElement(lyric, autoScroll === AutoScroll.Smooth);
-                focusManager.focus(lyric);
-                autoScroll = AutoScroll.Smooth;
+    function renderLyrics(lyrics) {
+        const container = view.querySelector('.dynamicLyricsContainer');
+        try {
+            if (lyricsPlayer) {
+                lyricsPlayer.dispose();
+                cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
+                lastUpdateTime = null;
             }
-        }
-    }
 
-    function updateAllLyricLines(currentLine, lyrics) {
-        for (let lyricIndex = 0; lyricIndex <= lyrics.length; lyricIndex++) {
-            if (lyricIndex < currentLine) {
-                setPastLyricClassOnLine(lyricIndex);
-            } else if (lyricIndex === currentLine) {
-                setCurrentLyricClassOnLine(lyricIndex);
-            } else if (lyricIndex > currentLine) {
-                setFutureLyricClassOnLine(lyricIndex);
+            // 检查歌词数组是否有效
+            if (!Array.isArray(lyrics) || !lyrics.length || !lyrics.some(l => l.Start && l.Text)) {
+                console.log('No valid lyrics found');
+                container.innerHTML = `<h1>${globalize.translate('HeaderNoLyrics')}</h1>`;
+                return;
             }
-        }
-    }
 
-    function renderNoLyricMessage() {
-        const itemsContainer = view.querySelector('.dynamicLyricsContainer');
-        if (itemsContainer) {
-            const html = `<h1> ${globalize.translate('HeaderNoLyrics')} </h1>`;
-            itemsContainer.innerHTML = html;
-        }
-        autoFocuser.autoFocus();
-    }
+            lyricsPlayer = new LyricPlayer({
+                enableBlur: true,
+                enableSpring: true
+            });
 
-    function renderDynamicLyrics(lyrics) {
-        const itemsContainer = view.querySelector('.dynamicLyricsContainer');
-        if (itemsContainer) {
-            const html = lyrics.reduce(dynamicLyricHtmlReducer, '');
-            itemsContainer.innerHTML = html;
-        }
+            bgRenderer = new EplorRenderer({
+                container: container,
+                enableBlur: true,
+                enableSpring: true
+            });
 
-        const lyricLineArray = itemsContainer.querySelectorAll('.lyricsLine');
+            bgRenderer.setLyricPlayer(lyricsPlayer);
 
-        // attaches click event listener to change playtime to lyric start
-        lyricLineArray.forEach(element => {
-            element.addEventListener('click', () => onLyricClick(element.getAttribute('data-lyrictime')));
-        });
+            const lyricLines = toLyricLines(lyrics);
+            console.log('Converted lyric lines:', lyricLines);
 
-        const currentIndex = getLyricIndex(getCurrentPlayTime(), lyrics);
-        updateAllLyricLines(currentIndex, savedLyrics);
-    }
+            container.innerHTML = '';
+            container.appendChild(lyricsPlayer.getElement());
 
-    function renderStaticLyrics(lyrics) {
-        const itemsContainer = view.querySelector('.dynamicLyricsContainer');
-        if (itemsContainer) {
-            const html = lyrics.reduce(staticLyricHtmlReducer, '');
-            itemsContainer.innerHTML = html;
-        }
-    }
+            // 设置歌词和初始时间
+            lyricsPlayer.setLyricLines(lyricLines);
+            lyricsPlayer.setCurrentTime(getCurrentTime());
 
-    function updateLyrics(lyrics) {
-        savedLyrics = lyrics;
-
-        isDynamicLyric = Object.prototype.hasOwnProperty.call(lyrics[0], 'Start');
-
-        if (isDynamicLyric) {
-            renderDynamicLyrics(savedLyrics);
-        } else {
-            renderStaticLyrics(savedLyrics);
-        }
-
-        autoFocuser.autoFocus(view);
-    }
-
-    function getLyrics(serverId, itemId) {
-        const apiClient = ServerConnections.getApiClient(serverId);
-
-        return apiClient.ajax({
-            url: apiClient.getUrl('Audio/' + itemId + '/Lyrics'),
-            type: 'GET',
-            dataType: 'json'
-        }).then((response) => {
-            if (!response.Lyrics) {
-                throw new Error();
-            }
-            return response.Lyrics;
-        });
-    }
-
-    function bindToPlayer(player) {
-        if (player === currentPlayer) {
-            return;
-        }
-
-        releaseCurrentPlayer();
-
-        currentPlayer = player;
-
-        if (!player) {
-            return;
-        }
-
-        Events.on(player, 'timeupdate', onTimeUpdate);
-        Events.on(player, 'playbackstart', onPlaybackStart);
-        Events.on(player, 'playbackstop', onPlaybackStop);
-    }
-
-    function releaseCurrentPlayer() {
-        const player = currentPlayer;
-
-        if (player) {
-            Events.off(player, 'timeupdate', onTimeUpdate);
-            Events.off(player, 'playbackstart', onPlaybackStart);
-            Events.off(player, 'playbackstop', onPlaybackStop);
-            currentPlayer = null;
-        }
-    }
-
-    function onLyricClick(lyricTime) {
-        autoScroll = AutoScroll.Smooth;
-        playbackManager.seek(lyricTime);
-        if (playbackManager.paused()) {
-            playbackManager.playPause(currentPlayer);
+            // 开始动画循环
+            lastUpdateTime = performance.now();
+            updateLyrics(getCurrentTime());
+        } catch (error) {
+            console.error('Error rendering lyrics:', error);
+            container.innerHTML = `<h1>${globalize.translate('HeaderNoLyrics')}</h1>`;
         }
     }
 
     function onTimeUpdate() {
-        if (isDynamicLyric) {
-            const currentIndex = getLyricIndex(getCurrentPlayTime(), savedLyrics);
-            updateAllLyricLines(currentIndex, savedLyrics);
+        if (!animationFrameId) {
+            lastUpdateTime = performance.now();
+            updateLyrics(getCurrentTime());
         }
     }
 
-    function onPlaybackStart(event, state) {
-        if (currentItem.Id !== state.NowPlayingItem.Id) {
-            onLoad();
-        }
-    }
-
-    function onPlaybackStop(_, state) {
-        // TODO: switch to appRouter.back(), with fix to navigation to /#/queue. Which is broken when it has nothing playing
-        if (!state.NextMediaType) {
-            appRouter.goHome();
-        }
-    }
-
-    function onPlayerChange() {
-        const player = playbackManager.getCurrentPlayer();
-        bindToPlayer(player);
+    function getLyrics(itemId, serverId) {
+        const apiClient = ServerConnections.getApiClient(serverId);
+        return apiClient.ajax({
+            url: apiClient.getUrl(`Audio/${itemId}/Lyrics`),
+            type: 'GET'
+        }).then(async response => {
+            console.log('Raw response:', response);
+            // 解析响应体
+            const data = await response.json();
+            console.log('Parsed lyrics data:', data);
+            return (data?.Lyrics && Array.isArray(data.Lyrics)) ? data.Lyrics : [];
+        }).catch(error => {
+            console.error('Error fetching lyrics:', error);
+            return [];
+        });
     }
 
     function onLoad() {
-        savedLyrics = null;
-        currentItem = null;
-        isDynamicLyric = false;
+        const player = playbackManager.getCurrentPlayer();
+        if (!player) {
+            appRouter.goHome();
+            return;
+        }
+
+        currentPlayer = player;
+        const state = playbackManager.getPlayerState(player);
+        currentItem = state.NowPlayingItem;
+
+        Events.on(player, 'timeupdate', onTimeUpdate);
+        Events.on(player, 'playbackstart', onLoad);
+        Events.on(player, 'playbackstop', () => appRouter.goHome());
 
         LibraryMenu.setTitle(globalize.translate('Lyrics'));
-
-        const player = playbackManager.getCurrentPlayer();
-
-        if (player) {
-            bindToPlayer(player);
-
-            const state = playbackManager.getPlayerState(player);
-            currentItem = state.NowPlayingItem;
-
-            const serverId = state.NowPlayingItem.ServerId;
-            const itemId = state.NowPlayingItem.Id;
-
-            getLyrics(serverId, itemId).then(updateLyrics).catch(renderNoLyricMessage);
-        } else {
-            // if nothing is currently playing, no lyrics to display redirect to home
-            appRouter.goHome();
-        }
+        getLyrics(currentItem.Id, currentItem.ServerId)
+            .then(renderLyrics)
+            .catch(() => renderLyrics([]));
     }
 
-    function onWheelOrTouchMove() {
-        autoScroll = AutoScroll.NoScroll;
-    }
+    view.addEventListener('viewshow', onLoad);
 
-    function onKeyDown(e) {
-        const key = keyboardNavigation.getKeyName(e);
-        if (key === 'ArrowUp' || key === 'ArrowDown') {
-            autoScroll = AutoScroll.NoScroll;
+    view.addEventListener('viewbeforehide', () => {
+        if (currentPlayer) {
+            Events.off(currentPlayer, 'timeupdate', onTimeUpdate);
+            Events.off(currentPlayer, 'playbackstart', onLoad);
+            Events.off(currentPlayer, 'playbackstop');
         }
-    }
-
-    view.addEventListener('viewshow', function () {
-        Events.on(playbackManager, 'playerchange', onPlayerChange);
-        autoScroll = AutoScroll.Instant;
-        document.addEventListener('wheel', onWheelOrTouchMove);
-        document.addEventListener('touchmove', onWheelOrTouchMove);
-        document.addEventListener('keydown', onKeyDown);
-        try {
-            onLoad();
-        } catch {
-            appRouter.goHome();
+        if (lyricsPlayer) {
+            cancelAnimationFrame(animationFrameId);
+            lyricsPlayer.dispose();
+            lyricsPlayer = null;
+            animationFrameId = null;
+            lastUpdateTime = null;
         }
-    });
-
-    view.addEventListener('viewbeforehide', function () {
-        Events.off(playbackManager, 'playerchange', onPlayerChange);
-        document.removeEventListener('wheel', onWheelOrTouchMove);
-        document.removeEventListener('touchmove', onWheelOrTouchMove);
-        document.removeEventListener('keydown', onKeyDown);
-        releaseCurrentPlayer();
+        lastUpdateTime = null;
+        currentPlayer = null;
+        currentItem = null;
     });
 }
